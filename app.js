@@ -58,7 +58,8 @@ const $ = (id) => document.getElementById(id);
 const el = {
   statusDot: $('status-dot'), statusText: $('status-text'),
   cardPairing: $('card-pairing'), cardConnected: $('card-connected'),
-  qr: $('qr'), roomCode: $('room-code'), btnCopy: $('btn-copy'), copyLabel: $('copy-label'),
+  qr: $('qr'), qrWrap: $('qr-wrap'), roomCode: $('room-code'), btnCopy: $('btn-copy'), copyLabel: $('copy-label'),
+  btnQrToggle: $('btn-qr-toggle'), qrToggleLabel: $('qr-toggle-label'),
   joinInput: $('join-input'), btnConnect: $('btn-connect'), connectLabel: $('connect-label'),
   btnDisconnect: $('btn-disconnect'), peerName: $('peer-name'), peerNameModal: $('peer-name-modal'),
   statTotal: $('stat-total'), statCount: $('stat-count'),
@@ -178,6 +179,12 @@ function renderQR(text) {
     console.warn('[p2p] QR render failed', e);
     el.qr.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;font:600 11px/1.4 var(--font-mono);color:var(--muted);text-align:center;">QR<br>' + roomCode + '</div>';
   }
+}
+let qrOpen = false;
+function setQrOpen(open) {
+  qrOpen = open;
+  el.qrWrap.dataset.open = open ? 'true' : 'false';
+  el.qrToggleLabel.textContent = open ? '隱藏 QR code' : '顯示 QR code';
 }
 function updateRoomUI() {
   el.roomCode.textContent = roomCode;
@@ -726,6 +733,8 @@ el.btnCopy.addEventListener('click', async () => {
   el.copyLabel.style.color = '#2f9e57';
   setTimeout(() => { el.copyLabel.textContent = '複製連結'; el.copyLabel.style.color = 'var(--muted)'; }, 1600);
 });
+
+el.btnQrToggle.addEventListener('click', () => setQrOpen(!qrOpen));
 
 el.joinInput.addEventListener('input', () => {
   const s = sanitizeCode(el.joinInput.value);

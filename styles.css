@@ -70,6 +70,17 @@ button { font-family: inherit; }
     * { animation: none !important; }
 }
 
+/* ===== Responsive: QR collapses behind a toggle on narrow screens ===== */
+@media (max-width: 719px) {
+    .p2p-files { order: -1; }
+    .p2p-qr-toggle { display: flex !important; }
+    .p2p-qr-wrap[data-open="false"] { display: none; }
+}
+@media (min-width: 720px) {
+    .p2p-qr-toggle { display: none !important; }
+    .p2p-qr-wrap { display: block !important; }
+}
+
 /* ===== Eyebrow chips ===== */
 .eyebrow {
     display: inline-flex;
