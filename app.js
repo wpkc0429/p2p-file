@@ -1,7 +1,8 @@
 /* ===================================================================
-   空投 P2P Drop — browser peer-to-peer file transfer
-   Real WebRTC DataChannel transfers, paired through a room-relay
-   signaling server. No server storage, no file-size limit.
+   PeerLink — browser multi-peer file transfer
+   Real WebRTC DataChannel mesh: each device opens a direct connection
+   to every other device in the room (up to 6 total) through a
+   room-relay signaling server. No server storage, no file-size limit.
    =================================================================== */
 'use strict';
 
@@ -21,6 +22,9 @@ const CHUNK_SIZE   = 16 * 1024;        // 16 KiB — safe across browsers
 const BUFFER_HIGH  = 4 * 1024 * 1024;  // pause sending above 4 MiB buffered
 const BUFFER_LOW   = 512 * 1024;       // resume once drained below 512 KiB
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const MAX_REMOTE_PEERS = 5;            // + self = 6 total room size (soft cap)
+const DECISION_TIMEOUT_MS = 25000;     // give up waiting on an accept/reject
+const NEGOTIATION_TIMEOUT_MS = 20000;  // give up on a peer stuck negotiating
 
 /* ------------------------------------------------------------------ *
  *  State
@@ -32,24 +36,18 @@ let   ws        = null;
 let   wsReconnectTimer = null;
 let   wantConnected = false;          // should the ws be open?
 
-let   pc        = null;
-let   dc        = null;
-let   peerId    = null;
-let   peerLabel = '對方裝置';
-let   polite    = false;
-let   makingOffer = false;
-let   ignoreOffer = false;
-let   pendingCandidates = [];
+const peers     = new Map();          // peerId -> PeerState
+let   peerPalCounter = 0;
 
 const files     = [];                 // all transfer records (in + out)
-const sendQueue = [];                 // outgoing records awaiting send
+const sendQueue = [];                 // outgoing records awaiting broadcast
 let   sending   = false;
-let   pendingDecision = null;         // { id, resolve, reject } for current outgoing offer
 
-const recvMap   = Object.create(null);// id -> incoming record
-let   currentRecvId = null;
-const incomingQueue = [];             // pending {id,name,size,mime} awaiting modal
+const recvMap   = Object.create(null);// transfer id -> incoming record (ids are globally unique)
+const incomingQueue = [];             // pending {peerId,peerLabel,id,name,size,mime} awaiting modal
 let   activeIncoming = null;
+
+const roomFullNoticeSeen = new Set(); // dedupe 'room-full' toasts per sender
 
 /* ------------------------------------------------------------------ *
  *  DOM refs
@@ -57,13 +55,17 @@ let   activeIncoming = null;
 const $ = (id) => document.getElementById(id);
 const el = {
   statusDot: $('status-dot'), statusText: $('status-text'),
-  cardPairing: $('card-pairing'), cardConnected: $('card-connected'),
+  cardConnected: $('card-connected'), cardPairing: $('card-pairing'),
+  peerRoster: $('peer-roster'), noPeers: $('no-peers'),
+  roomCodeEyebrow: $('room-code-eyebrow'),
+  statTotal: $('stat-total'), statRoomCount: $('stat-room-count'), statMyLinks: $('stat-my-links'),
+  pairEyebrowText: $('pair-eyebrow-text'), pairDesc: $('pair-desc'),
   qr: $('qr'), qrWrap: $('qr-wrap'), roomCode: $('room-code'), btnCopy: $('btn-copy'), copyLabel: $('copy-label'),
   btnQrToggle: $('btn-qr-toggle'), qrToggleLabel: $('qr-toggle-label'),
-  joinInput: $('join-input'), btnConnect: $('btn-connect'), connectLabel: $('connect-label'),
-  btnDisconnect: $('btn-disconnect'), peerName: $('peer-name'), peerNameModal: $('peer-name-modal'),
-  statTotal: $('stat-total'), statCount: $('stat-count'),
-  dropzone: $('dropzone'), dropTitle: $('drop-title'), fileInput: $('file-input'),
+  joinWrap: $('join-wrap'), joinInput: $('join-input'), btnConnect: $('btn-connect'), connectLabel: $('connect-label'),
+  btnDisconnect: $('btn-disconnect'), roomFullNote: $('room-full-note'),
+  peerNameModal: $('peer-name-modal'),
+  dropzone: $('dropzone'), dropTitle: $('drop-title'), dropSub: $('drop-sub'), fileInput: $('file-input'),
   btnClear: $('btn-clear'), emptyState: $('empty-state'), fileList: $('file-list'),
   modal: $('modal-incoming'), incIcon: $('inc-icon'), incExt: $('inc-ext'),
   incName: $('inc-name'), incSize: $('inc-size'), btnAccept: $('btn-accept'), btnReject: $('btn-reject'),
@@ -101,6 +103,7 @@ function ext(name) {
 }
 const GRADS = ['var(--gradient-1)', 'var(--gradient-2)', 'var(--gradient-3)', 'var(--gradient-4)'];
 function palette(i) { return GRADS[i % GRADS.length]; }
+function nextPeerPal() { return peerPalCounter++; }
 
 function deviceLabel() {
   const ua = navigator.userAgent;
@@ -130,27 +133,71 @@ function toast(msg) {
   toastTimer = setTimeout(() => { el.toast.hidden = true; }, 3200);
 }
 
+function isTerminal(status) { return status === 'done' || status === 'rejected' || status === 'error'; }
+function countConnected() {
+  let n = 0;
+  for (const p of peers.values()) if (p.connState === 'connected') n++;
+  return n;
+}
+
 /* ------------------------------------------------------------------ *
- *  Status + card UI
+ *  Status pill + room dashboard chrome
  * ------------------------------------------------------------------ */
-const STATUS = {
-  offline:    ['#c26a3b', '離線'],
-  connecting: ['#3b52c4', '連線中…'],
-  waiting:    ['#c26a3b', '等待對方'],
-  paired:     ['#3b52c4', '配對中…'],
-  connected:  ['#2f9e57', '已連線'],
-};
 let statusKey = 'connecting';
-function setStatus(key) {
+function setStatus(key, label) {
   statusKey = key;
-  const [color, text] = STATUS[key] || STATUS.offline;
+  const MAP = {
+    offline:    ['#c26a3b', '離線'],
+    connecting: ['#3b52c4', '連線中…'],
+    waiting:    ['#c26a3b', '等待裝置加入'],
+    pairing:    ['#3b52c4', '配對中…'],
+    connected:  ['#2f9e57', label],
+  };
+  const [color, text] = MAP[key] || MAP.offline;
   el.statusDot.style.background = color;
   el.statusText.style.color = color;
   el.statusText.textContent = text;
-  const connected = key === 'connected';
-  el.cardConnected.classList.toggle('hidden', !connected);
-  el.cardPairing.classList.toggle('hidden', connected);
-  el.dropTitle.textContent = connected ? '選擇要傳送的檔案' : '完成配對後即可傳檔';
+}
+function updateStatusFromRoster() {
+  if (!wantConnected) { setStatus('offline'); return; }
+  const connected = countConnected();
+  if (connected > 0) { setStatus('connected', (connected + 1) + ' 人已連線'); return; }
+  if (peers.size > 0) { setStatus('pairing'); return; }
+  if (ws && ws.readyState === WebSocket.OPEN) { setStatus('waiting'); return; }
+  setStatus('connecting');
+}
+function updatePairingVisibility() {
+  const connected = countConnected();
+  const full = connected >= MAX_REMOTE_PEERS;
+  el.cardPairing.classList.toggle('hidden', full);
+  el.roomFullNote.classList.toggle('hidden', !full);
+  el.joinWrap.classList.toggle('hidden', connected > 0);
+  el.btnConnect.classList.toggle('hidden', connected > 0);
+  el.pairEyebrowText.textContent = connected > 0 ? '邀請更多裝置' : '建立 / 加入房間';
+  el.pairDesc.textContent = connected > 0
+    ? '房間還沒滿，把代碼或 QR code 分享給下一台裝置，最多可到 6 人。'
+    : '把房間代碼或 QR code 分享給大家，最多 6 台裝置可同時在房間內互傳。連上後每台裝置會與其他每台各開一條 WebRTC 連線。';
+}
+function updateDropCopy() {
+  const n = countConnected();
+  if (n > 0) {
+    el.dropTitle.textContent = '選擇要傳送的檔案';
+    el.dropSub.textContent = '檔案將同時傳送給所有已連線裝置（' + n + ' 台）· 點擊選擇或拖入 · 無大小限制';
+  } else {
+    el.dropTitle.textContent = '等待裝置加入房間';
+    el.dropSub.textContent = '邀請其他裝置加入房間後，選擇檔案即會廣播給所有已連線裝置';
+  }
+}
+function updateRoomStats() {
+  const n = countConnected();
+  el.statRoomCount.textContent = (n + 1) + ' / 6';
+  el.statMyLinks.textContent = n + ' 條';
+}
+function refreshRoomUI() {
+  updateStatusFromRoster();
+  updatePairingVisibility();
+  updateDropCopy();
+  updateRoomStats();
 }
 
 /* ------------------------------------------------------------------ *
@@ -180,14 +227,9 @@ function renderQR(text) {
     el.qr.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;font:600 11px/1.4 var(--font-mono);color:var(--muted);text-align:center;">QR<br>' + roomCode + '</div>';
   }
 }
-let qrOpen = false;
-function setQrOpen(open) {
-  qrOpen = open;
-  el.qrWrap.dataset.open = open ? 'true' : 'false';
-  el.qrToggleLabel.textContent = open ? '隱藏 QR code' : '顯示 QR code';
-}
 function updateRoomUI() {
   el.roomCode.textContent = roomCode;
+  el.roomCodeEyebrow.textContent = roomCode;
   renderQR(shareLink());
   try {
     const url = new URL(location.href);
@@ -195,9 +237,16 @@ function updateRoomUI() {
     history.replaceState(null, '', url);
   } catch (e) {}
 }
+let qrOpen = false;
+function setQrOpen(open) {
+  qrOpen = open;
+  el.qrWrap.dataset.open = open ? 'true' : 'false';
+  el.qrToggleLabel.textContent = open ? '隱藏 QR code' : '顯示 QR code';
+}
 
 /* ------------------------------------------------------------------ *
- *  Signaling (WebSocket room relay)
+ *  Signaling (WebSocket room relay) — broadcasts to everyone in the
+ *  room; `to` targets one peer, omitting it reaches the whole room.
  * ------------------------------------------------------------------ */
 function sig(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -219,7 +268,7 @@ function connectSignaling(room) {
   }
   ws.onopen = () => {
     console.log('[p2p] signaling open, room=' + room);
-    if (!peerId) setStatus('waiting');
+    updateStatusFromRoster();
     sig({ kind: 'hello', name: myLabel });
   };
   ws.onmessage = (ev) => {
@@ -243,157 +292,239 @@ function closeWs() {
   }
 }
 function scheduleReconnect(room) {
-  if (statusKey !== 'connected') setStatus('offline');
+  if (countConnected() === 0) setStatus('offline');
   clearTimeout(wsReconnectTimer);
   wsReconnectTimer = setTimeout(() => {
     if (wantConnected && room === roomCode) connectSignaling(room);
   }, 2000);
 }
 
+function isRoomFull() { return peers.size >= MAX_REMOTE_PEERS; }
+
 function onSignal(msg) {
-  if (msg.kind === 'hello') {
-    if (msg.name) peerLabel = msg.name;
-    if (!peerId) {
-      peerId = msg.from;
-      setupPeer();
-      sig({ kind: 'hello', name: myLabel });   // re-announce so an earlier peer learns us
-    }
-  } else if (msg.kind === 'desc') {
-    if (!peerId) { peerId = msg.from; setupPeer(); }
-    handleDescription(msg.description).catch(e => console.warn('[p2p] desc error', e));
-  } else if (msg.kind === 'ice') {
-    if (!peerId) { peerId = msg.from; setupPeer(); }
-    handleCandidate(msg.candidate).catch(() => {});
-  } else if (msg.kind === 'bye') {
-    if (msg.from === peerId) handlePeerGone('對方已離開房間');
+  switch (msg.kind) {
+    case 'hello':     return handleHello(msg);
+    case 'desc':      return handleDesc(msg);
+    case 'ice':       return handleIce(msg);
+    case 'bye':       return handleBye(msg);
+    case 'room-full': return handleRoomFull(msg);
   }
+}
+function handleHello(msg) {
+  const existing = peers.get(msg.from);
+  if (existing) { if (msg.name) { existing.label = msg.name; updatePeerChip(existing); } return; }
+  if (isRoomFull()) { sig({ kind: 'room-full', to: msg.from }); return; }
+  setupPeer(msg.from, msg.name || '裝置');
+  sig({ kind: 'hello', name: myLabel });   // re-announce so the new peer (and anyone else) learns us too
+}
+function handleDesc(msg) {
+  let p = peers.get(msg.from);
+  if (!p) {
+    if (isRoomFull()) { sig({ kind: 'room-full', to: msg.from }); return; }
+    p = setupPeer(msg.from, '裝置');
+  }
+  handleDescription(p, msg.description).catch(e => console.warn('[p2p] desc error', e));
+}
+function handleIce(msg) {
+  let p = peers.get(msg.from);
+  if (!p) {
+    if (isRoomFull()) return;
+    p = setupPeer(msg.from, '裝置');
+  }
+  handleCandidate(p, msg.candidate).catch(() => {});
+}
+function handleBye(msg) {
+  const p = peers.get(msg.from);
+  if (p) teardownPeer(p, '對方已離開房間');
+}
+function handleRoomFull(msg) {
+  if (roomFullNoticeSeen.has(msg.from)) return;
+  roomFullNoticeSeen.add(msg.from);
+  toast('房間可能已滿（上限 6 人），部分裝置或許無法加入');
 }
 
 /* ------------------------------------------------------------------ *
- *  WebRTC — perfect negotiation
+ *  WebRTC — perfect negotiation, one RTCPeerConnection per peer
  * ------------------------------------------------------------------ */
-function setupPeer() {
-  if (pc) return;
-  polite = myId < peerId;                    // deterministic, opposite on each side
-  setStatus('paired');
-  if (el.peerName) el.peerName.textContent = peerLabel;
-  if (el.peerNameModal) el.peerNameModal.textContent = peerLabel;
+function setupPeer(id, label) {
+  const existing = peers.get(id);
+  if (existing) return existing;
 
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  pendingCandidates = [];
+  const p = {
+    id, label,
+    pc: null, dc: null,
+    polite: myId < id, makingOffer: false, ignoreOffer: false, pendingCandidates: [],
+    connState: 'connecting', pal: nextPeerPal(), chipEl: null,
+    pendingDecision: null, currentRecvId: null, negTimer: null,
+  };
+  peers.set(id, p);
 
-  pc.onnegotiationneeded = async () => {
+  p.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  p.pc.onnegotiationneeded = async () => {
     try {
-      makingOffer = true;
-      await pc.setLocalDescription();
-      sig({ kind: 'desc', to: peerId, description: pc.localDescription });
+      p.makingOffer = true;
+      await p.pc.setLocalDescription();
+      sig({ kind: 'desc', to: p.id, description: p.pc.localDescription });
     } catch (e) {
       console.warn('[p2p] negotiation error', e);
     } finally {
-      makingOffer = false;
+      p.makingOffer = false;
     }
   };
-  pc.onicecandidate = ({ candidate }) => {
-    if (candidate) sig({ kind: 'ice', to: peerId, candidate });
+  p.pc.onicecandidate = ({ candidate }) => {
+    if (candidate) sig({ kind: 'ice', to: p.id, candidate });
   };
-  pc.onconnectionstatechange = () => {
-    const st = pc && pc.connectionState;
-    console.log('[p2p] pc state:', st);
-    if (st === 'failed') { toast('連線失敗，請重新配對'); handlePeerGone(); }
+  p.pc.onconnectionstatechange = () => {
+    const st = p.pc && p.pc.connectionState;
+    console.log('[p2p] pc state (' + p.label + '):', st);
+    if (st === 'failed') { toast(p.label + ' 連線失敗'); teardownPeer(p, p.label + ' 連線失敗'); }
   };
-  pc.ondatachannel = (e) => setupDataChannel(e.channel);
+  p.pc.ondatachannel = (e) => setupDataChannel(p, e.channel);
 
-  if (!polite) {                             // impolite peer initiates
-    setupDataChannel(pc.createDataChannel('p2p-file', { ordered: true }));
+  if (!p.polite) {                           // impolite peer initiates
+    setupDataChannel(p, p.pc.createDataChannel('p2p-file', { ordered: true }));
   }
+
+  p.negTimer = setTimeout(() => {
+    if (p.connState !== 'connected') { toast(p.label + ' 連線逾時'); teardownPeer(p, null); }
+  }, NEGOTIATION_TIMEOUT_MS);
+
+  renderPeerChip(p);
+  refreshRoomUI();
+  return p;
 }
 
-async function handleDescription(desc) {
-  if (!desc || !pc) return;
-  const offerCollision = desc.type === 'offer' && (makingOffer || pc.signalingState !== 'stable');
-  ignoreOffer = !polite && offerCollision;
-  if (ignoreOffer) return;
-  await pc.setRemoteDescription(desc);
-  await flushCandidates();
+async function handleDescription(p, desc) {
+  if (!desc || !p.pc) return;
+  const offerCollision = desc.type === 'offer' && (p.makingOffer || p.pc.signalingState !== 'stable');
+  p.ignoreOffer = !p.polite && offerCollision;
+  if (p.ignoreOffer) return;
+  await p.pc.setRemoteDescription(desc);
+  await flushCandidates(p);
   if (desc.type === 'offer') {
-    await pc.setLocalDescription();
-    sig({ kind: 'desc', to: peerId, description: pc.localDescription });
+    await p.pc.setLocalDescription();
+    sig({ kind: 'desc', to: p.id, description: p.pc.localDescription });
   }
 }
-async function handleCandidate(candidate) {
-  if (!candidate || !pc) return;
-  if (pc.remoteDescription && pc.remoteDescription.type) {
-    try { await pc.addIceCandidate(candidate); } catch (e) { if (!ignoreOffer) throw e; }
+async function handleCandidate(p, candidate) {
+  if (!candidate || !p.pc) return;
+  if (p.pc.remoteDescription && p.pc.remoteDescription.type) {
+    try { await p.pc.addIceCandidate(candidate); } catch (e) { if (!p.ignoreOffer) throw e; }
   } else {
-    pendingCandidates.push(candidate);
+    p.pendingCandidates.push(candidate);
   }
 }
-async function flushCandidates() {
-  const list = pendingCandidates;
-  pendingCandidates = [];
+async function flushCandidates(p) {
+  const list = p.pendingCandidates;
+  p.pendingCandidates = [];
   for (const c of list) {
-    try { await pc.addIceCandidate(c); } catch (e) {}
+    try { await p.pc.addIceCandidate(c); } catch (e) {}
   }
 }
 
 /* ------------------------------------------------------------------ *
- *  Data channel + connection lifecycle
+ *  Data channel + per-peer lifecycle
  * ------------------------------------------------------------------ */
-function setupDataChannel(ch) {
-  dc = ch;
-  dc.binaryType = 'arraybuffer';
-  dc.bufferedAmountLowThreshold = BUFFER_LOW;
-  dc.onopen = onConnected;
-  dc.onclose = () => handlePeerGone('連線已中斷');
-  dc.onerror = (e) => console.warn('[p2p] dc error', e);
-  dc.onmessage = (e) => onDcMessage(e.data);
+function setupDataChannel(p, ch) {
+  p.dc = ch;
+  ch.binaryType = 'arraybuffer';
+  ch.bufferedAmountLowThreshold = BUFFER_LOW;
+  ch.onopen = () => onPeerConnected(p);
+  ch.onclose = () => teardownPeer(p, p.label + ' 連線已中斷');
+  ch.onerror = (e) => console.warn('[p2p] dc error', e);
+  ch.onmessage = (e) => onDcMessage(p, e.data);
 }
-function onConnected() {
-  setStatus('connected');
-  el.peerName.textContent = peerLabel;
-  el.peerNameModal.textContent = peerLabel;
-  toast('已與 ' + peerLabel + ' 建立連線');
-  pumpSendQueue();
+function onPeerConnected(p) {
+  clearTimeout(p.negTimer);
+  p.connState = 'connected';
+  updatePeerChip(p);
+  toast('已與 ' + p.label + ' 建立連線');
+  refreshRoomUI();
 }
-function handlePeerGone(message) {
-  const wasConnected = statusKey === 'connected' || statusKey === 'paired';
-  teardownPeer();
-  if (wantConnected) {
-    setStatus('waiting');
-    if (wasConnected && message) toast(message);
-  }
-}
-function teardownPeer() {
-  if (dc) { dc.onopen = dc.onclose = dc.onerror = dc.onmessage = null; try { dc.close(); } catch (e) {} dc = null; }
-  if (pc) { pc.onnegotiationneeded = pc.onicecandidate = pc.onconnectionstatechange = pc.ondatachannel = null; try { pc.close(); } catch (e) {} pc = null; }
-  peerId = null; makingOffer = false; ignoreOffer = false; pendingCandidates = [];
+function teardownPeer(p, reason) {
+  if (!peers.has(p.id)) return;
+  clearTimeout(p.negTimer);
+  if (p.dc) { p.dc.onopen = p.dc.onclose = p.dc.onerror = p.dc.onmessage = null; try { p.dc.close(); } catch (e) {} p.dc = null; }
+  if (p.pc) { p.pc.onnegotiationneeded = p.pc.onicecandidate = p.pc.onconnectionstatechange = p.pc.ondatachannel = null; try { p.pc.close(); } catch (e) {} p.pc = null; }
 
-  if (pendingDecision) { const p = pendingDecision; pendingDecision = null; p.reject(new Error('disconnected')); }
-  sendQueue.length = 0;
-  currentRecvId = null;
-  for (const k in recvMap) delete recvMap[k];
-  incomingQueue.length = 0; activeIncoming = null; el.modal.classList.add('hidden');
+  if (p.pendingDecision) { const pd = p.pendingDecision; p.pendingDecision = null; clearTimeout(pd.timer); pd.resolve('error'); }
 
-  for (const rec of files) {
-    if (rec.status === 'sending' || rec.status === 'receiving' || rec.status === 'waiting') {
-      rec.status = 'error';
-      renderRow(rec);
+  failPeerTargets(p.id);
+  for (const id in recvMap) {
+    if (recvMap[id].peerId === p.id && !isTerminal(recvMap[id].status)) {
+      recvMap[id].status = 'error';
+      renderRow(recvMap[id]);
     }
   }
+  removeIncomingFromPeer(p.id);
+
+  removePeerChip(p);
+  peers.delete(p.id);
+
+  if (wantConnected && reason) toast(reason);
   updateStats();
+  refreshRoomUI();
+}
+function teardownAllPeers() {
+  for (const p of Array.from(peers.values())) teardownPeer(p, null);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Peer roster UI
+ * ------------------------------------------------------------------ */
+function peerChipHtml(p) {
+  return (
+    '<span style="width:30px;height:30px;flex:none;border-radius:9px;background:' + palette(p.pal) + ';display:flex;align-items:center;justify-content:center;">' +
+      '<svg width="15" height="15" viewBox="0 0 24 24" fill="none"><rect x="4" y="3" width="16" height="18" rx="2.4" stroke="#fff" stroke-width="1.9"/><path d="M10 18h4" stroke="#fff" stroke-width="1.9" stroke-linecap="round"/></svg>' +
+    '</span>' +
+    '<span data-name style="flex:1;min-width:0;font:600 12.5px/1.2 var(--font-display);color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></span>' +
+    '<span data-dot style="position:absolute;top:8px;right:9px;width:9px;height:9px;border-radius:50%;"></span>'
+  );
+}
+function renderPeerChip(p) {
+  const node = document.createElement('div');
+  node.setAttribute('data-peer-chip', p.id);
+  node.style.cssText = 'position:relative;flex:1 1 132px;min-width:132px;display:flex;align-items:center;gap:9px;padding:10px 12px;border-radius:12px;background:var(--bg);border:1px solid var(--border);box-shadow:var(--shadow-card);animation:p2p-pop 0.3s ease both;';
+  node.innerHTML = peerChipHtml(p);
+  p.chipEl = node;
+  el.peerRoster.appendChild(node);
+  updatePeerChip(p);
+}
+function updatePeerChip(p) {
+  if (!p.chipEl) return;
+  el.noPeers.classList.toggle('hidden', peers.size > 0);
+  p.chipEl.querySelector('[data-name]').textContent = p.label;
+  const dot = p.chipEl.querySelector('[data-dot]');
+  if (p.connState === 'connected') {
+    dot.style.background = '#2f9e57';
+    dot.style.boxShadow = '0 0 0 2px rgba(47,158,87,0.18)';
+    dot.style.animation = 'none';
+  } else {
+    dot.style.background = '#c26a3b';
+    dot.style.boxShadow = 'none';
+    dot.style.animation = 'ring 2s ease-out infinite';
+  }
+}
+function removePeerChip(p) {
+  if (p.chipEl && p.chipEl.parentNode) p.chipEl.parentNode.removeChild(p.chipEl);
+  p.chipEl = null;
+  el.noPeers.classList.toggle('hidden', peers.size > 0);
 }
 
 /* ------------------------------------------------------------------ *
  *  Transfer records + rendering
+ *  `targets` = the other parties in this transfer: every connected
+ *  peer for an outbound broadcast, or the single sender for an inbound
+ *  receive — both directions share the same shape and render path.
  * ------------------------------------------------------------------ */
 function createRecord(o) {
   const rec = {
     id: o.id || (myId + '-' + Date.now().toString(36) + '-' + files.length),
     name: o.name, size: o.size || 0, mime: o.mime || '',
-    dir: o.dir, status: o.dir === 'out' ? 'waiting' : 'receiving',
-    transferred: 0, file: o.file || null, pal: files.length,
-    chunks: o.dir === 'in' ? [] : null, blobUrl: null,
-    speed: 0, node: null, els: null,
+    dir: o.dir, file: o.file || null, pal: files.length,
+    targets: o.targets,             // [{peerId,label,status,sent,speed,_lastTs,_lastBytes}]
+    transferred: 0, speed: 0,
+    blobUrl: null, node: null, els: null,
   };
   files.push(rec);
   buildRow(rec);
@@ -401,6 +532,14 @@ function createRecord(o) {
   updateStats();
   return rec;
 }
+function syncAggregate(rec) {
+  let sent = 0, speed = 0;
+  for (const t of rec.targets) { sent += t.sent; speed += (t.speed || 0); }
+  rec.transferred = sent;
+  rec.speed = speed;
+}
+function isRecordTerminal(rec) { return rec.targets.every(t => isTerminal(t.status)); }
+
 function buildRow(rec) {
   const card = document.createElement('div');
   card.style.cssText = 'background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);box-shadow:var(--shadow-card);padding:15px 16px;animation:p2p-pop 0.35s ease both;';
@@ -417,54 +556,87 @@ function buildRow(rec) {
           '<span style="flex:none;font:600 9px/1 var(--font-mono);color:' + dirColor + ';border:1px solid ' + dirColor + ';border-radius:5px;padding:2px 5px;">' + dirLabel + '</span>' +
         '</div>' +
         '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:3px;">' +
-          '<span data-meta style="font:500 11px/1 var(--font-mono);color:var(--muted);"></span>' +
-          '<span data-status style="font:600 11px/1 var(--font-mono);color:var(--muted);"></span>' +
+          '<span data-meta style="font:500 11px/1 var(--font-mono);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></span>' +
+          '<span data-status style="flex:none;font:600 11px/1 var(--font-mono);color:var(--muted);"></span>' +
         '</div>' +
       '</div>' +
       '<button data-dl class="hidden" style="flex:none;width:36px;height:36px;border-radius:10px;border:1px solid var(--border-strong);background:#fff;display:flex;align-items:center;justify-content:center;color:var(--navy);cursor:pointer;transition:all var(--transition);">' +
         '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M12 4v11M12 15l-4-4M12 15l4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 19h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' +
       '</button>' +
     '</div>' +
-    '<div data-barwrap style="margin-top:11px;height:7px;border-radius:9999px;background:var(--bg);overflow:hidden;">' +
-      '<div data-bar style="height:100%;border-radius:9999px;background:' + (rec.dir === 'in' ? 'var(--gradient-3)' : 'var(--gradient-1)') + ';width:0%;transition:width 0.15s linear;"></div>' +
-    '</div>';
+    '<div data-barwrap style="margin-top:11px;display:flex;align-items:center;gap:10px;">' +
+      '<div style="flex:1;height:7px;border-radius:9999px;background:var(--bg);overflow:hidden;">' +
+        '<div data-bar style="height:100%;border-radius:9999px;background:' + (rec.dir === 'in' ? 'var(--gradient-3)' : 'var(--gradient-1)') + ';width:0%;transition:width 0.15s linear;"></div>' +
+      '</div>' +
+      '<span data-pcttext style="flex:none;font:700 11px/1 var(--font-mono);min-width:34px;text-align:right;"></span>' +
+    '</div>' +
+    '<div data-peerdetail style="margin-top:9px;font:500 10.5px/1.6 var(--font-mono);color:var(--muted);word-break:break-word;display:none;"></div>';
   rec.node = card;
   rec.els = {
     meta: card.querySelector('[data-meta]'),
     status: card.querySelector('[data-status]'),
     bar: card.querySelector('[data-bar]'),
     barwrap: card.querySelector('[data-barwrap]'),
+    pctText: card.querySelector('[data-pcttext]'),
+    peerDetail: card.querySelector('[data-peerdetail]'),
     dl: card.querySelector('[data-dl]'),
   };
   rec.els.dl.addEventListener('click', (e) => { e.stopPropagation(); downloadReceived(rec); });
   el.fileList.insertBefore(card, el.fileList.firstChild);
   renderRow(rec);
 }
+function targetStatusText(t) {
+  if (t.status === 'done') return '✓ 完成';
+  if (t.status === 'rejected') return '已拒絕';
+  if (t.status === 'error') return '中斷';
+  if (t.status === 'sending') return Math.floor((t.sent / (t.size || 1)) * 100) + '%';
+  return '等待中';
+}
 function renderRow(rec) {
   const e = rec.els; if (!e) return;
-  const pct = rec.size ? Math.min(100, (rec.transferred / rec.size) * 100) : 0;
-  e.meta.textContent = fmt(rec.transferred) + ' / ' + fmt(rec.size);
+  syncAggregate(rec);
+  const multi = rec.targets.length > 1;
+  const totalSize = rec.size * rec.targets.length;
+  const pct = totalSize ? Math.min(100, (rec.transferred / totalSize) * 100) : 0;
+  const allDone = rec.targets.every(t => t.status === 'done');
+  const anySending = rec.targets.some(t => t.status === 'sending');
+  const allTerminal = isRecordTerminal(rec);
+  const arrow = rec.dir === 'in' ? '← ' : '→ ';
 
-  let label = '等待中', color = 'var(--muted)';
-  if (rec.status === 'done') { label = '✓ 完成'; color = '#2f9e57'; }
-  else if (rec.status === 'rejected') { label = '已拒絕'; color = '#c26a3b'; }
-  else if (rec.status === 'error') { label = '中斷'; color = '#c26a3b'; }
-  else if (rec.status === 'sending' || rec.status === 'receiving') {
-    label = Math.floor(pct) + '%';
-    if (rec.speed > 0) {
-      label += ' · ' + fmt(rec.speed) + '/s';
-      const remain = (rec.size - rec.transferred) / rec.speed;
-      if (remain >= 1) label += ' · ' + (remain >= 60 ? Math.round(remain / 60) + '分' : Math.ceil(remain) + '秒');
-    }
-    color = 'var(--blue)';
+  if (multi) {
+    e.meta.textContent = arrow + '廣播 · ' + rec.targets.length + ' 人 · ' + fmt(rec.transferred) + ' / ' + fmt(totalSize);
+  } else {
+    const t = rec.targets[0];
+    e.meta.textContent = arrow + t.label + ' · ' + fmt(t.sent) + ' / ' + fmt(rec.size);
   }
+
+  let label, color;
+  if (allDone) { label = '✓ 完成'; color = '#2f9e57'; }
+  else if (allTerminal) {
+    const done = rec.targets.filter(t => t.status === 'done').length;
+    label = done + '/' + rec.targets.length + ' 完成'; color = '#c26a3b';
+  } else if (anySending) {
+    const spd = rec.speed > 0 ? fmt(rec.speed) + '/s' : '';
+    const remain = rec.speed > 0 ? Math.max(0, (totalSize - rec.transferred) / rec.speed) : 0;
+    const eta = remain >= 1 ? ' · ' + (remain >= 60 ? Math.round(remain / 60) + '分' : Math.ceil(remain) + '秒') : '';
+    label = (spd + eta).trim() || '傳輸中'; color = 'var(--blue)';
+  } else { label = '等待中'; color = 'var(--muted)'; }
   e.status.textContent = label;
   e.status.style.color = color;
 
-  const terminal = rec.status === 'done' || rec.status === 'rejected' || rec.status === 'error';
-  e.barwrap.style.display = terminal ? 'none' : '';
+  e.barwrap.style.display = allTerminal ? 'none' : '';
   e.bar.style.width = pct.toFixed(1) + '%';
-  e.dl.classList.toggle('hidden', !(rec.dir === 'in' && rec.status === 'done'));
+  e.pctText.textContent = anySending ? Math.floor(pct) + '%' : '';
+  e.pctText.style.color = color;
+
+  if (multi) {
+    e.peerDetail.style.display = '';
+    e.peerDetail.textContent = rec.targets.map(t => t.label + ' ' + targetStatusText(t)).join('  ·  ');
+  } else {
+    e.peerDetail.style.display = 'none';
+  }
+
+  e.dl.classList.toggle('hidden', !(rec.dir === 'in' && allDone));
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -478,7 +650,6 @@ function updateStats() {
     let total = 0;
     for (const r of files) total += r.transferred;
     el.statTotal.textContent = fmt(total);
-    el.statCount.textContent = String(files.length);
   });
 }
 function updateChrome() {
@@ -487,29 +658,33 @@ function updateChrome() {
   el.btnClear.classList.toggle('hidden', !has);
 }
 
-/* progress throttling */
-function onProgress(rec) {
+/* progress throttling — per target, coalesced into a single row render */
+function onTargetProgress(rec, target) {
   const now = performance.now();
-  if (rec._lastTs == null) { rec._lastTs = now; rec._lastBytes = 0; }
-  const dt = now - rec._lastTs;
-  const done = rec.transferred >= rec.size;
+  if (target._lastTs == null) { target._lastTs = now; target._lastBytes = 0; }
+  const dt = now - target._lastTs;
+  const done = target.sent >= rec.size;
   if (dt >= 120 || done) {
-    rec.speed = dt > 0 ? ((rec.transferred - rec._lastBytes) / (dt / 1000)) : rec.speed;
-    rec._lastTs = now; rec._lastBytes = rec.transferred;
+    target.speed = dt > 0 ? ((target.sent - target._lastBytes) / (dt / 1000)) : target.speed;
+    target._lastTs = now; target._lastBytes = target.sent;
     renderRow(rec);
     updateStats();
   }
 }
 
 /* ------------------------------------------------------------------ *
- *  Sending
+ *  Sending (broadcast to every connected peer)
  * ------------------------------------------------------------------ */
 function enqueueFiles(fileList) {
   const arr = Array.from(fileList || []);
   if (!arr.length) return;
-  if (!dc || dc.readyState !== 'open') { toast('請先與對方建立連線'); return; }
+  const recipients = Array.from(peers.values()).filter(p => p.dc && p.dc.readyState === 'open');
+  if (!recipients.length) { toast('目前房間裡沒有已連線的裝置'); return; }
   for (const file of arr) {
-    const rec = createRecord({ dir: 'out', name: file.name, size: file.size, mime: file.type, file });
+    const rec = createRecord({
+      dir: 'out', name: file.name, size: file.size, mime: file.type, file,
+      targets: recipients.map(p => ({ peerId: p.id, label: p.label, status: 'waiting', sent: 0, speed: 0, _lastTs: null, _lastBytes: null, size: file.size })),
+    });
     sendQueue.push(rec);
   }
   pumpSendQueue();
@@ -518,107 +693,127 @@ async function pumpSendQueue() {
   if (sending) return;
   sending = true;
   try {
-    while (sendQueue.length && dc && dc.readyState === 'open') {
+    while (sendQueue.length) {
       const rec = sendQueue.shift();
-      try { await sendOne(rec); }
-      catch (e) {
-        console.warn('[p2p] send aborted', e);
-        if (rec.status !== 'done' && rec.status !== 'rejected') { rec.status = 'error'; renderRow(rec); }
-      }
+      await sendBroadcast(rec);
     }
   } finally {
     sending = false;
   }
 }
-function sendOne(rec) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      dcSend(JSON.stringify({ t: 'meta', id: rec.id, name: rec.name, size: rec.size, mime: rec.mime }));
-      const decision = await waitDecision(rec.id);
-      if (decision === 'reject') {
-        rec.status = 'rejected'; renderRow(rec);
-        toast('對方拒絕了 ' + rec.name);
-        return resolve();
-      }
-      rec.status = 'sending'; renderRow(rec);
-      dcSend(JSON.stringify({ t: 'begin', id: rec.id }));
-      await streamFile(rec);
-      dcSend(JSON.stringify({ t: 'end', id: rec.id }));
-      rec.transferred = rec.size; rec.status = 'done';
-      renderRow(rec); updateStats();
-      resolve();
-    } catch (e) { reject(e); }
+async function sendBroadcast(rec) {
+  await Promise.allSettled(rec.targets.map(t => sendToTarget(rec, t)));
+  renderRow(rec);
+  updateStats();
+}
+async function sendToTarget(rec, target) {
+  const p = peers.get(target.peerId);
+  if (!p || !p.dc || p.dc.readyState !== 'open') { target.status = 'error'; renderRow(rec); return; }
+  try {
+    dcSendTo(p, JSON.stringify({ t: 'meta', id: rec.id, name: rec.name, size: rec.size, mime: rec.mime }));
+    const decision = await waitDecision(p);
+    if (decision !== 'accept') {
+      target.status = decision === 'reject' ? 'rejected' : 'error';
+      renderRow(rec);
+      if (decision === 'reject') toast(p.label + ' 拒絕了 ' + rec.name);
+      return;
+    }
+    target.status = 'sending'; renderRow(rec);
+    dcSendTo(p, JSON.stringify({ t: 'begin', id: rec.id }));
+    await streamFileToTarget(rec, target, p);
+    dcSendTo(p, JSON.stringify({ t: 'end', id: rec.id }));
+    target.sent = rec.size; target.status = 'done';
+    renderRow(rec); updateStats();
+  } catch (e) {
+    console.warn('[p2p] send to ' + p.label + ' aborted', e);
+    if (!isTerminal(target.status)) { target.status = 'error'; renderRow(rec); }
+  }
+}
+function waitDecision(p) {
+  return new Promise((resolve) => {
+    const entry = {
+      resolve: (v) => { clearTimeout(entry.timer); if (p.pendingDecision === entry) p.pendingDecision = null; resolve(v); },
+      timer: null,
+    };
+    entry.timer = setTimeout(() => entry.resolve('error'), DECISION_TIMEOUT_MS);
+    p.pendingDecision = entry;
   });
 }
-function waitDecision(id) {
-  return new Promise((resolve, reject) => { pendingDecision = { id, resolve, reject }; });
-}
-async function streamFile(rec) {
+async function streamFileToTarget(rec, target, p) {
   const file = rec.file;
   let offset = 0;
   while (offset < file.size) {
-    if (!dc || dc.readyState !== 'open') throw new Error('channel closed');
-    if (dc.bufferedAmount > BUFFER_HIGH) { await drain(); continue; }
+    if (!p.dc || p.dc.readyState !== 'open') throw new Error('channel closed');
+    if (p.dc.bufferedAmount > BUFFER_HIGH) { await drain(p.dc); continue; }
     const end = Math.min(offset + CHUNK_SIZE, file.size);
     const buf = await file.slice(offset, end).arrayBuffer();
-    if (!dc || dc.readyState !== 'open') throw new Error('channel closed');
-    dc.send(buf);
+    if (!p.dc || p.dc.readyState !== 'open') throw new Error('channel closed');
+    p.dc.send(buf);
     offset = end;
-    rec.transferred = offset;
-    onProgress(rec);
+    target.sent = offset;
+    onTargetProgress(rec, target);
   }
 }
-function drain() {
+function drain(dc) {
   return new Promise((resolve) => {
-    const ch = dc;
-    if (!ch || ch.readyState !== 'open') return resolve();
+    if (!dc || dc.readyState !== 'open') return resolve();
     const done = () => {
-      ch.removeEventListener('bufferedamountlow', done);
-      ch.removeEventListener('close', done);
+      dc.removeEventListener('bufferedamountlow', done);
+      dc.removeEventListener('close', done);
       resolve();
     };
-    ch.addEventListener('bufferedamountlow', done);  // buffer drained
-    ch.addEventListener('close', done);              // ...or channel died — don't hang
+    dc.addEventListener('bufferedamountlow', done);  // buffer drained
+    dc.addEventListener('close', done);              // ...or channel died — don't hang
   });
 }
-function dcSend(data) {
-  if (dc && dc.readyState === 'open') dc.send(data);
+function dcSendTo(p, data) {
+  if (p && p.dc && p.dc.readyState === 'open') p.dc.send(data);
+}
+function failPeerTargets(peerId) {
+  for (const rec of files) {
+    if (rec.dir !== 'out') continue;
+    let touched = false;
+    for (const t of rec.targets) {
+      if (t.peerId === peerId && !isTerminal(t.status)) { t.status = 'error'; touched = true; }
+    }
+    if (touched) renderRow(rec);
+  }
+  updateStats();
 }
 
 /* ------------------------------------------------------------------ *
  *  Receiving
  * ------------------------------------------------------------------ */
-function onDcMessage(data) {
+function onDcMessage(p, data) {
   if (typeof data === 'string') {
     let msg; try { msg = JSON.parse(data); } catch (e) { return; }
-    onControl(msg);
+    onControl(p, msg);
   } else {
-    const rec = currentRecvId ? recvMap[currentRecvId] : null;
+    const rec = p.currentRecvId ? recvMap[p.currentRecvId] : null;
     if (!rec) return;
     const buf = data instanceof ArrayBuffer ? data : null;
     if (!buf) return;
-    rec.chunks.push(buf);
-    rec.transferred += buf.byteLength;
-    onProgress(rec);
+    const target = rec.targets[0];
+    rec._chunks.push(buf);
+    target.sent += buf.byteLength;
+    onTargetProgress(rec, target);
   }
 }
-function onControl(msg) {
+function onControl(p, msg) {
   switch (msg.t) {
     case 'meta':
-      incomingQueue.push({ id: msg.id, name: msg.name, size: msg.size, mime: msg.mime });
+      incomingQueue.push({ peerId: p.id, peerLabel: p.label, id: msg.id, name: msg.name, size: msg.size, mime: msg.mime });
       maybeShowIncoming();
       break;
     case 'accept':
-      if (pendingDecision && pendingDecision.id === msg.id) { const p = pendingDecision; pendingDecision = null; p.resolve('accept'); }
-      break;
     case 'reject':
-      if (pendingDecision && pendingDecision.id === msg.id) { const p = pendingDecision; pendingDecision = null; p.resolve('reject'); }
+      if (p.pendingDecision) { const pd = p.pendingDecision; p.pendingDecision = null; clearTimeout(pd.timer); pd.resolve(msg.t); }
       break;
     case 'begin':
-      currentRecvId = msg.id;
+      p.currentRecvId = msg.id;
       break;
     case 'end':
-      finalizeReceive(msg.id);
+      finalizeReceive(p, msg.id);
       break;
   }
 }
@@ -629,36 +824,54 @@ function maybeShowIncoming() {
   el.incSize.textContent = fmt(activeIncoming.size);
   el.incExt.textContent = ext(activeIncoming.name);
   el.incIcon.style.background = palette(files.length);
-  el.peerNameModal.textContent = peerLabel;
+  el.peerNameModal.textContent = activeIncoming.peerLabel;
   el.modal.classList.remove('hidden');
 }
 function acceptIncoming() {
   const inc = activeIncoming; if (!inc) return;
+  const p = peers.get(inc.peerId);
   activeIncoming = null;
   el.modal.classList.add('hidden');
-  dcSend(JSON.stringify({ t: 'accept', id: inc.id }));
-  const rec = createRecord({ dir: 'in', id: inc.id, name: inc.name, size: inc.size, mime: inc.mime });
+  if (!p) { maybeShowIncoming(); return; }
+  dcSendTo(p, JSON.stringify({ t: 'accept', id: inc.id }));
+  const rec = createRecord({
+    dir: 'in', id: inc.id, name: inc.name, size: inc.size, mime: inc.mime,
+    targets: [{ peerId: p.id, label: p.label, status: 'sending', sent: 0, speed: 0, _lastTs: null, _lastBytes: null, size: inc.size }],
+  });
+  rec._chunks = [];
   recvMap[inc.id] = rec;
-  currentRecvId = inc.id;
+  p.currentRecvId = inc.id;
   renderRow(rec);
   maybeShowIncoming();
 }
 function rejectIncoming() {
   const inc = activeIncoming; if (!inc) return;
+  const p = peers.get(inc.peerId);
   activeIncoming = null;
   el.modal.classList.add('hidden');
-  dcSend(JSON.stringify({ t: 'reject', id: inc.id }));
+  if (p) dcSendTo(p, JSON.stringify({ t: 'reject', id: inc.id }));
   maybeShowIncoming();
 }
-function finalizeReceive(id) {
+function removeIncomingFromPeer(peerId) {
+  for (let i = incomingQueue.length - 1; i >= 0; i--) {
+    if (incomingQueue[i].peerId === peerId) incomingQueue.splice(i, 1);
+  }
+  if (activeIncoming && activeIncoming.peerId === peerId) {
+    activeIncoming = null;
+    el.modal.classList.add('hidden');
+    maybeShowIncoming();
+  }
+}
+function finalizeReceive(p, id) {
   const rec = recvMap[id]; if (!rec) return;
-  const blob = new Blob(rec.chunks, { type: rec.mime || 'application/octet-stream' });
+  const blob = new Blob(rec._chunks, { type: rec.mime || 'application/octet-stream' });
   rec.blobUrl = URL.createObjectURL(blob);
-  rec.chunks = [];
-  rec.transferred = rec.size || blob.size;
-  rec.status = 'done';
+  rec._chunks = [];
+  const target = rec.targets[0];
+  target.sent = rec.size || blob.size;
+  target.status = 'done';
   renderRow(rec); updateStats();
-  if (currentRecvId === id) currentRecvId = null;
+  if (p.currentRecvId === id) p.currentRecvId = null;
   delete recvMap[id];
   toast('已收到 ' + rec.name);
 }
@@ -675,7 +888,7 @@ function downloadReceived(rec) {
 function clearDone() {
   for (let i = files.length - 1; i >= 0; i--) {
     const r = files[i];
-    if (r.status === 'done' || r.status === 'rejected' || r.status === 'error') {
+    if (isRecordTerminal(r)) {
       if (r.blobUrl) { try { URL.revokeObjectURL(r.blobUrl); } catch (e) {} }
       if (r.node && r.node.parentNode) r.node.parentNode.removeChild(r.node);
       files.splice(i, 1);
@@ -691,7 +904,7 @@ function clearDone() {
 function joinRoom(code) {
   code = sanitizeCode(code);
   if (!code) return;
-  teardownPeer();
+  teardownAllPeers();
   roomCode = code;
   updateRoomUI();
   el.joinInput.value = '';
@@ -700,11 +913,12 @@ function joinRoom(code) {
   toast('正在加入房間 ' + roomCode);
 }
 function disconnect() {
-  teardownPeer();
-  roomCode = genCode();          // fresh room so the old peer can't rejoin
+  sig({ kind: 'bye' });
+  teardownAllPeers();
+  roomCode = genCode();          // fresh room so old peers can't rejoin
+  roomFullNoticeSeen.clear();
   updateRoomUI();
   connectSignaling(roomCode);
-  setStatus('waiting');
 }
 function refreshConnectBtn() {
   const code = sanitizeCode(el.joinInput.value);
@@ -752,8 +966,8 @@ el.btnAccept.addEventListener('click', acceptIncoming);
 el.btnReject.addEventListener('click', rejectIncoming);
 
 el.dropzone.addEventListener('click', () => {
-  if (dc && dc.readyState === 'open') el.fileInput.click();
-  else { toast('請先與對方建立連線'); el.joinInput.focus(); }
+  if (countConnected() > 0) el.fileInput.click();
+  else { toast('請先邀請裝置加入房間'); el.joinInput.focus(); }
 });
 el.fileInput.addEventListener('change', (e) => { enqueueFiles(e.target.files); e.target.value = ''; });
 el.dropzone.addEventListener('dragover', (e) => {
@@ -787,4 +1001,5 @@ window.addEventListener('beforeunload', () => { wantConnected = false; sig({ kin
   updateRoomUI();
   refreshConnectBtn();
   connectSignaling(roomCode);
+  refreshRoomUI();
 })();
