@@ -95,6 +95,7 @@ button { font-family: inherit; }
 .eyebrow-dot { width: 6px; height: 6px; border-radius: 9999px; background: currentColor; }
 .eyebrow-navy { color: var(--navy); border-color: rgba(14, 61, 100, 0.28); background: rgba(14, 61, 100, 0.06); }
 .eyebrow-blue { color: var(--blue); border-color: rgba(59, 82, 196, 0.28); background: rgba(59, 82, 196, 0.06); }
+.eyebrow-purple { color: var(--purple); border-color: rgba(109, 75, 196, 0.28); background: rgba(109, 75, 196, 0.06); }
 
 /* ===== Buttons ===== */
 .btn {

@@ -140,27 +140,71 @@
       </div>
     </section>
 
-    <!-- RIGHT: files -->
+    <!-- RIGHT: files + chat -->
     <section class="p2p-files" style="flex:1.3 1 360px;display:flex;flex-direction:column;gap:14px;">
-      <div id="dropzone" style="position:relative;border:2px dashed var(--border-strong);border-radius:var(--radius-md);background:var(--surface);padding:34px 24px;text-align:center;cursor:pointer;transition:all var(--transition);">
-        <input id="file-input" type="file" multiple style="display:none;" />
-        <div style="width:58px;height:58px;margin:0 auto 14px;border-radius:16px;background:var(--gradient-3);display:flex;align-items:center;justify-content:center;box-shadow:0 12px 26px -12px rgba(109,75,196,0.6);animation:floaty 5s ease-in-out infinite;">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M12 16V4M12 4L7 9M12 4l5 5" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" stroke="#fff" stroke-width="2.1" stroke-linecap="round"/></svg>
+
+      <!-- tab bar: files / messages -->
+      <div style="display:flex;gap:6px;padding:5px;border-radius:14px;background:var(--bg);border:1px solid var(--border);">
+        <button id="tab-files" style="flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px;border:none;cursor:pointer;border-radius:10px;background:var(--gradient-1);box-shadow:0 6px 14px -8px rgba(14,61,100,0.55);font:700 12.5px/1 var(--font-display);color:#fff;transition:all var(--transition);">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 16V4M12 4L7 9M12 4l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <span>檔案傳輸</span>
+          <span id="badge-files" class="hidden" style="min-width:17px;height:17px;padding:0 4px;border-radius:9999px;background:var(--blue);color:#fff;font:700 9.5px/17px var(--font-mono);text-align:center;animation:ring 2s ease-out infinite;">0</span>
+        </button>
+        <button id="tab-chat" style="position:relative;flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px;border:none;cursor:pointer;border-radius:10px;background:transparent;box-shadow:none;font:700 12.5px/1 var(--font-display);color:var(--muted);transition:all var(--transition);">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M20 12a7 7 0 0 1-9.5 6.5L5 20l1.5-4.5A7 7 0 1 1 20 12z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>
+          <span>訊息 · 剪貼簿</span>
+          <span id="badge-chat" class="hidden" style="min-width:17px;height:17px;padding:0 4px;border-radius:9999px;background:var(--purple);color:#fff;font:700 9.5px/17px var(--font-mono);text-align:center;animation:ring 2s ease-out infinite;">0</span>
+        </button>
+      </div>
+
+      <!-- panel: file transfer -->
+      <div id="panel-files" style="display:flex;flex-direction:column;gap:14px;">
+        <div id="dropzone" style="position:relative;border:2px dashed var(--border-strong);border-radius:var(--radius-md);background:var(--surface);padding:34px 24px;text-align:center;cursor:pointer;transition:all var(--transition);">
+          <input id="file-input" type="file" multiple style="display:none;" />
+          <div style="width:58px;height:58px;margin:0 auto 14px;border-radius:16px;background:var(--gradient-3);display:flex;align-items:center;justify-content:center;box-shadow:0 12px 26px -12px rgba(109,75,196,0.6);animation:floaty 5s ease-in-out infinite;">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M12 16V4M12 4L7 9M12 4l5 5" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" stroke="#fff" stroke-width="2.1" stroke-linecap="round"/></svg>
+          </div>
+          <div id="drop-title" style="font-weight:700;font-size:16.5px;letter-spacing:-0.01em;color:var(--ink);">等待裝置加入房間</div>
+          <p id="drop-sub" style="margin:8px auto 0;max-width:300px;font-size:12.5px;line-height:1.6;color:var(--muted);">邀請其他裝置加入房間後，選擇檔案即會廣播給所有已連線裝置</p>
         </div>
-        <div id="drop-title" style="font-weight:700;font-size:16.5px;letter-spacing:-0.01em;color:var(--ink);">等待裝置加入房間</div>
-        <p id="drop-sub" style="margin:8px auto 0;max-width:300px;font-size:12.5px;line-height:1.6;color:var(--muted);">邀請其他裝置加入房間後，選擇檔案即會廣播給所有已連線裝置</p>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:2px 2px 0;">
+          <span style="font:600 11px/1 var(--font-mono);letter-spacing:0.14em;color:var(--muted);">傳輸佇列</span>
+          <button id="btn-clear" class="hidden" style="font:600 11px/1 var(--font-mono);color:var(--muted);background:none;border:none;cursor:pointer;padding:4px;">清除已完成</button>
+        </div>
+
+        <div id="empty-state" style="border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface);box-shadow:var(--shadow-card);padding:40px 20px;text-align:center;">
+          <div style="font:500 12.5px/1.6 var(--font-mono);color:#94a3b8;">尚無傳輸紀錄<br/>選擇檔案後將在此顯示進度</div>
+        </div>
+
+        <div id="file-list" style="display:flex;flex-direction:column;gap:14px;"></div>
       </div>
 
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:2px 2px 0;">
-        <span style="font:600 11px/1 var(--font-mono);letter-spacing:0.14em;color:var(--muted);">傳輸佇列</span>
-        <button id="btn-clear" class="hidden" style="font:600 11px/1 var(--font-mono);color:var(--muted);background:none;border:none;cursor:pointer;padding:4px;">清除已完成</button>
-      </div>
+      <!-- panel: messages / clipboard -->
+      <div id="panel-chat" class="hidden" style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);box-shadow:var(--shadow-card);padding:20px;display:flex;flex-direction:column;gap:14px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+          <div class="eyebrow eyebrow-purple"><span class="eyebrow-dot"></span>訊息 · 剪貼簿</div>
+          <span id="msg-count" style="font:600 11px/1 var(--font-mono);color:var(--muted);">尚無訊息</span>
+        </div>
+        <p style="margin:-4px 0 0;font-size:12px;line-height:1.6;color:var(--muted);">即時訊息與剪貼簿共用同一條連線，貼上網址、驗證碼或程式碼片段，房間內每台裝置都能一鍵複製。</p>
 
-      <div id="empty-state" style="border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface);box-shadow:var(--shadow-card);padding:40px 20px;text-align:center;">
-        <div style="font:500 12.5px/1.6 var(--font-mono);color:#94a3b8;">尚無傳輸紀錄<br/>選擇檔案後將在此顯示進度</div>
-      </div>
+        <div id="chat-list" style="min-height:220px;max-height:360px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:2px;">
+          <div id="chat-empty" style="margin:auto;padding:34px 20px;text-align:center;border:1px dashed var(--border-strong);border-radius:var(--radius-md);background:var(--bg);">
+            <div style="font:500 12.5px/1.6 var(--font-mono);color:#94a3b8;">加入房間後即可開始傳訊息</div>
+          </div>
+        </div>
 
-      <div id="file-list" style="display:flex;flex-direction:column;gap:14px;"></div>
+        <div id="chat-input-row" style="display:flex;gap:8px;align-items:flex-end;">
+          <textarea id="chat-draft" placeholder="輸入訊息或貼上文字…（Enter 送出 · Shift+Enter 換行）" rows="1" style="flex:1;min-width:0;resize:none;min-height:46px;max-height:120px;padding:13px 14px;border-radius:12px;border:1px solid var(--border-strong);background:#fff;font:500 13px/1.45 var(--font-display);color:var(--ink);outline:none;"></textarea>
+          <button id="btn-send" aria-label="送出" style="flex:none;width:46px;height:46px;border-radius:12px;border:none;background:var(--gradient-1);display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 8px 18px -9px rgba(14,61,100,0.6);">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none"><path d="M5 12h13M12 5l7 7-7 7" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <div id="chat-offline" style="display:flex;align-items:center;gap:9px;padding:13px 15px;border-radius:12px;border:1px dashed var(--border-strong);background:var(--bg);">
+          <span style="width:8px;height:8px;border-radius:50%;background:#c26a3b;animation:ring 2s ease-out infinite;"></span>
+          <span style="font:500 12px/1.4 var(--font-mono);color:var(--muted);">加入房間後即可即時傳訊息與共用剪貼簿內容。</span>
+        </div>
+      </div>
 
       <div style="margin-top:6px;padding-top:16px;border-top:1px dashed var(--border-strong);">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:9px;">

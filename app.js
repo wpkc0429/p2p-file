@@ -25,6 +25,7 @@ const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MAX_REMOTE_PEERS = 5;            // + self = 6 total room size (soft cap)
 const DECISION_TIMEOUT_MS = 25000;     // give up waiting on an accept/reject
 const NEGOTIATION_TIMEOUT_MS = 20000;  // give up on a peer stuck negotiating
+const CHAT_MAX_LEN = 8000;             // clamp a single chat/clipboard message
 
 /* ------------------------------------------------------------------ *
  *  State
@@ -49,6 +50,11 @@ let   activeIncoming = null;
 
 const roomFullNoticeSeen = new Set(); // dedupe 'room-full' toasts per sender
 
+const messages  = [];                 // chat/clipboard log {id,mine,from,text,time,mono,node}
+let   activeTab = 'files';            // 'files' | 'chat'
+let   unread    = 0;                  // chat msgs arrived while not on the chat tab
+let   fileUnread = 0;                 // incoming files accepted while not on the files tab
+
 /* ------------------------------------------------------------------ *
  *  DOM refs
  * ------------------------------------------------------------------ */
@@ -67,6 +73,10 @@ const el = {
   peerNameModal: $('peer-name-modal'),
   dropzone: $('dropzone'), dropTitle: $('drop-title'), dropSub: $('drop-sub'), fileInput: $('file-input'),
   btnClear: $('btn-clear'), emptyState: $('empty-state'), fileList: $('file-list'),
+  tabFiles: $('tab-files'), tabChat: $('tab-chat'), badgeFiles: $('badge-files'), badgeChat: $('badge-chat'),
+  panelFiles: $('panel-files'), panelChat: $('panel-chat'),
+  chatList: $('chat-list'), chatEmpty: $('chat-empty'), msgCount: $('msg-count'),
+  chatInputRow: $('chat-input-row'), chatOffline: $('chat-offline'), chatDraft: $('chat-draft'), btnSend: $('btn-send'),
   modal: $('modal-incoming'), incIcon: $('inc-icon'), incExt: $('inc-ext'),
   incName: $('inc-name'), incSize: $('inc-size'), btnAccept: $('btn-accept'), btnReject: $('btn-reject'),
   toast: $('toast'),
@@ -131,6 +141,25 @@ function toast(msg) {
   el.toast.style.animation = '';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.toast.hidden = true; }, 3200);
+}
+
+function nowHM() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+// heuristic: render as monospace when the text looks like a link / code / long paste
+function looksMono(t) {
+  const s = t.trim();
+  return /\n/.test(t) || t.length > 56 || /^https?:\/\//i.test(s) || /^[\w.+-]+@[\w.-]+$/.test(s) || /[{};=<>]/.test(t);
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) {}
+  const ta = document.createElement('textarea');
+  ta.value = text; document.body.appendChild(ta); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (_) {}
+  ta.remove();
+  return ok;
 }
 
 function isTerminal(status) { return status === 'done' || status === 'rejected' || status === 'error'; }
@@ -198,6 +227,7 @@ function refreshRoomUI() {
   updatePairingVisibility();
   updateDropCopy();
   updateRoomStats();
+  updateChatChrome();
 }
 
 /* ------------------------------------------------------------------ *
@@ -815,6 +845,9 @@ function onControl(p, msg) {
     case 'end':
       finalizeReceive(p, msg.id);
       break;
+    case 'chat':
+      receiveChat(p, msg.text);
+      break;
   }
 }
 function maybeShowIncoming() {
@@ -842,6 +875,7 @@ function acceptIncoming() {
   recvMap[inc.id] = rec;
   p.currentRecvId = inc.id;
   renderRow(rec);
+  if (activeTab !== 'files') { fileUnread++; renderTabBadges(); }
   maybeShowIncoming();
 }
 function rejectIncoming() {
@@ -899,12 +933,130 @@ function clearDone() {
 }
 
 /* ------------------------------------------------------------------ *
+ *  Tabs (file transfer / messages) + unread badges
+ * ------------------------------------------------------------------ */
+function styleTab(btn, active) {
+  btn.style.background = active ? 'var(--gradient-1)' : 'transparent';
+  btn.style.color = active ? '#fff' : 'var(--muted)';
+  btn.style.boxShadow = active ? '0 6px 14px -8px rgba(14,61,100,0.55)' : 'none';
+}
+function renderTabBadges() {
+  const showChat = unread > 0 && activeTab !== 'chat';
+  el.badgeChat.classList.toggle('hidden', !showChat);
+  el.badgeChat.textContent = unread > 9 ? '9+' : String(unread);
+  const showFiles = fileUnread > 0 && activeTab !== 'files';
+  el.badgeFiles.classList.toggle('hidden', !showFiles);
+  el.badgeFiles.textContent = fileUnread > 9 ? '9+' : String(fileUnread);
+}
+function setActiveTab(tab) {
+  activeTab = tab;
+  const filesActive = tab === 'files';
+  styleTab(el.tabFiles, filesActive);
+  styleTab(el.tabChat, !filesActive);
+  el.panelFiles.classList.toggle('hidden', !filesActive);
+  el.panelChat.classList.toggle('hidden', filesActive);
+  if (filesActive) fileUnread = 0;
+  else { unread = 0; scrollChatToBottom(); }
+  renderTabBadges();
+}
+
+/* ------------------------------------------------------------------ *
+ *  Chat / clipboard — plain-text messages broadcast over the same
+ *  DataChannel mesh as files (JSON control message `t:'chat'`). No
+ *  history is persisted; the log lives only in memory for this room.
+ * ------------------------------------------------------------------ */
+function updateChatChrome() {
+  const connected = countConnected() > 0;
+  el.chatInputRow.classList.toggle('hidden', !connected);
+  el.chatOffline.classList.toggle('hidden', connected);
+  const emptyInner = el.chatEmpty.firstElementChild;
+  if (emptyInner) emptyInner.textContent = connected
+    ? '還沒有訊息 · 貼上文字即可跨裝置共用'
+    : '加入房間後即可開始傳訊息';
+  el.chatEmpty.classList.toggle('hidden', messages.length > 0);
+  el.msgCount.textContent = messages.length ? messages.length + ' 則訊息' : '尚無訊息';
+}
+function scrollChatToBottom() {
+  requestAnimationFrame(() => { el.chatList.scrollTop = el.chatList.scrollHeight; });
+}
+function renderMessage(m) {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;flex-direction:column;align-items:' + (m.mine ? 'flex-end' : 'flex-start') + ';gap:3px;animation:p2p-pop 0.25s ease both;';
+  const head = document.createElement('span');
+  head.style.cssText = 'font:600 10px/1 var(--font-mono);color:var(--muted);letter-spacing:0.02em;padding:0 4px;';
+  head.textContent = (m.mine ? '我' : m.from) + ' · ' + m.time;
+  const bubble = document.createElement('div');
+  bubble.style.cssText = 'max-width:82%;position:relative;padding:10px 13px;border-radius:14px;background:' +
+    (m.mine ? 'var(--gradient-1)' : 'var(--bg)') + ';border:1px solid ' + (m.mine ? 'transparent' : 'var(--border)') + ';';
+  const body = document.createElement('div');
+  body.style.cssText = 'font:500 13px/1.5 ' + (m.mono ? 'var(--font-mono)' : 'var(--font-display)') +
+    ';color:' + (m.mine ? '#ffffff' : 'var(--ink)') + ';white-space:pre-wrap;word-break:break-word;';
+  body.textContent = m.text;               // textContent — never inject chat text as HTML
+  const copyBtn = document.createElement('button');
+  copyBtn.style.cssText = 'margin-top:7px;display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;padding:0;font:600 10px/1 var(--font-mono);color:' + (m.mine ? 'rgba(255,255,255,0.82)' : 'var(--muted)') + ';';
+  copyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.9"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg><span>複製</span>';
+  const lbl = copyBtn.querySelector('span');
+  copyBtn.addEventListener('click', async () => {
+    await copyText(m.text);
+    lbl.textContent = '已複製';
+    clearTimeout(m._ct);
+    m._ct = setTimeout(() => { lbl.textContent = '複製'; }, 1500);
+  });
+  bubble.appendChild(body);
+  bubble.appendChild(copyBtn);
+  wrap.appendChild(head);
+  wrap.appendChild(bubble);
+  m.node = wrap;
+  el.chatList.appendChild(wrap);
+}
+function addMessage(m) {
+  messages.push(m);
+  renderMessage(m);
+  updateChatChrome();
+  scrollChatToBottom();
+}
+function sendChat() {
+  const text = el.chatDraft.value.trim();
+  if (!text) return;
+  const recipients = Array.from(peers.values()).filter(p => p.dc && p.dc.readyState === 'open');
+  if (!recipients.length) { toast('目前房間裡沒有已連線的裝置'); return; }
+  const clipped = text.slice(0, CHAT_MAX_LEN);
+  for (const p of recipients) dcSendTo(p, JSON.stringify({ t: 'chat', text: clipped }));
+  el.chatDraft.value = '';
+  autoResizeDraft();
+  addMessage({ id: 'm' + Date.now(), mine: true, from: '我', text: clipped, time: nowHM(), mono: looksMono(clipped) });
+}
+function receiveChat(p, text) {
+  if (typeof text !== 'string') return;
+  text = text.slice(0, CHAT_MAX_LEN);
+  if (!text) return;
+  addMessage({ id: 'm' + Date.now() + '-' + p.id, mine: false, from: p.label, text, time: nowHM(), mono: looksMono(text) });
+  if (activeTab !== 'chat') { unread++; renderTabBadges(); }
+}
+function autoResizeDraft() {
+  el.chatDraft.style.height = 'auto';
+  el.chatDraft.style.height = Math.min(120, el.chatDraft.scrollHeight) + 'px';
+}
+function clearChat() {
+  for (const m of messages) {
+    clearTimeout(m._ct);
+    if (m.node && m.node.parentNode) m.node.parentNode.removeChild(m.node);
+  }
+  messages.length = 0;
+  unread = 0;
+  fileUnread = 0;
+  updateChatChrome();
+  setActiveTab('files');
+}
+
+/* ------------------------------------------------------------------ *
  *  Room actions
  * ------------------------------------------------------------------ */
 function joinRoom(code) {
   code = sanitizeCode(code);
   if (!code) return;
   teardownAllPeers();
+  clearChat();
   roomCode = code;
   updateRoomUI();
   el.joinInput.value = '';
@@ -915,6 +1067,7 @@ function joinRoom(code) {
 function disconnect() {
   sig({ kind: 'bye' });
   teardownAllPeers();
+  clearChat();
   roomCode = genCode();          // fresh room so old peers can't rejoin
   roomFullNoticeSeen.clear();
   updateRoomUI();
@@ -935,17 +1088,18 @@ function refreshConnectBtn() {
  *  Event wiring
  * ------------------------------------------------------------------ */
 el.btnCopy.addEventListener('click', async () => {
-  const link = shareLink();
-  try { await navigator.clipboard.writeText(link); }
-  catch (e) {
-    const ta = document.createElement('textarea');
-    ta.value = link; document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); } catch (_) {}
-    ta.remove();
-  }
+  await copyText(shareLink());
   el.copyLabel.textContent = '已複製連結';
   el.copyLabel.style.color = '#2f9e57';
   setTimeout(() => { el.copyLabel.textContent = '複製連結'; el.copyLabel.style.color = 'var(--muted)'; }, 1600);
+});
+
+el.tabFiles.addEventListener('click', () => setActiveTab('files'));
+el.tabChat.addEventListener('click', () => setActiveTab('chat'));
+el.btnSend.addEventListener('click', sendChat);
+el.chatDraft.addEventListener('input', autoResizeDraft);
+el.chatDraft.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
 });
 
 el.btnQrToggle.addEventListener('click', () => setQrOpen(!qrOpen));
