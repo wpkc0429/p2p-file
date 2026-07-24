@@ -176,11 +176,11 @@ let statusKey = 'connecting';
 function setStatus(key, label) {
   statusKey = key;
   const MAP = {
-    offline:    ['#c26a3b', '離線'],
+    offline:    ['#a45a32', '離線'],
     connecting: ['#3b52c4', '連線中…'],
-    waiting:    ['#c26a3b', '等待裝置加入'],
+    waiting:    ['#a45a32', '等待裝置加入'],
     pairing:    ['#3b52c4', '配對中…'],
-    connected:  ['#2f9e57', label],
+    connected:  ['#257e45', label],
   };
   const [color, text] = MAP[key] || MAP.offline;
   el.statusDot.style.background = color;
@@ -526,11 +526,11 @@ function updatePeerChip(p) {
   p.chipEl.querySelector('[data-name]').textContent = p.label;
   const dot = p.chipEl.querySelector('[data-dot]');
   if (p.connState === 'connected') {
-    dot.style.background = '#2f9e57';
-    dot.style.boxShadow = '0 0 0 2px rgba(47,158,87,0.18)';
+    dot.style.background = '#257e45';
+    dot.style.boxShadow = '0 0 0 2px rgba(37,126,69,0.18)';
     dot.style.animation = 'none';
   } else {
-    dot.style.background = '#c26a3b';
+    dot.style.background = '#a45a32';
     dot.style.boxShadow = 'none';
     dot.style.animation = 'ring 2s ease-out infinite';
   }
@@ -641,10 +641,10 @@ function renderRow(rec) {
   }
 
   let label, color;
-  if (allDone) { label = '✓ 完成'; color = '#2f9e57'; }
+  if (allDone) { label = '✓ 完成'; color = '#257e45'; }
   else if (allTerminal) {
     const done = rec.targets.filter(t => t.status === 'done').length;
-    label = done + '/' + rec.targets.length + ' 完成'; color = '#c26a3b';
+    label = done + '/' + rec.targets.length + ' 完成'; color = '#a45a32';
   } else if (anySending) {
     const spd = rec.speed > 0 ? fmt(rec.speed) + '/s' : '';
     const remain = rec.speed > 0 ? Math.max(0, (totalSize - rec.transferred) / rec.speed) : 0;
@@ -1090,7 +1090,7 @@ function refreshConnectBtn() {
 el.btnCopy.addEventListener('click', async () => {
   await copyText(shareLink());
   el.copyLabel.textContent = '已複製連結';
-  el.copyLabel.style.color = '#2f9e57';
+  el.copyLabel.style.color = '#257e45';
   setTimeout(() => { el.copyLabel.textContent = '複製連結'; el.copyLabel.style.color = 'var(--muted)'; }, 1600);
 });
 
