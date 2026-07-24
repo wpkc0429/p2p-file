@@ -458,8 +458,8 @@ function teardownPeer(p, reason) {
   }
   removeIncomingFromPeer(p.id);
 
-  removePeerChip(p);
   peers.delete(p.id);
+  removePeerChip(p);
 
   if (wantConnected && reason) toast(reason);
   updateStats();
