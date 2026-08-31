@@ -51,9 +51,12 @@ let   activeIncoming = null;
 const roomFullNoticeSeen = new Set(); // dedupe 'room-full' toasts per sender
 
 const messages  = [];                 // chat/clipboard log {id,mine,from,text,time,mono,node}
-let   activeTab = 'files';            // 'files' | 'chat'
+let   activeTab = 'files';            // 'files' | 'chat' | 'screen'
 let   unread    = 0;                  // chat msgs arrived while not on the chat tab
 let   fileUnread = 0;                 // incoming files accepted while not on the files tab
+
+let   localScreenStream = null;       // our own getDisplayMedia() stream, or null when not sharing
+let   screenUnread = 0;               // live share tiles that appeared while not on the screen tab
 
 /* ------------------------------------------------------------------ *
  *  DOM refs
@@ -73,10 +76,13 @@ const el = {
   peerNameModal: $('peer-name-modal'),
   dropzone: $('dropzone'), dropTitle: $('drop-title'), dropSub: $('drop-sub'), fileInput: $('file-input'),
   btnClear: $('btn-clear'), emptyState: $('empty-state'), fileList: $('file-list'),
-  tabFiles: $('tab-files'), tabChat: $('tab-chat'), badgeFiles: $('badge-files'), badgeChat: $('badge-chat'),
-  panelFiles: $('panel-files'), panelChat: $('panel-chat'),
+  tabFiles: $('tab-files'), tabChat: $('tab-chat'), tabScreen: $('tab-screen'),
+  badgeFiles: $('badge-files'), badgeChat: $('badge-chat'), badgeScreen: $('badge-screen'),
+  panelFiles: $('panel-files'), panelChat: $('panel-chat'), panelScreen: $('panel-screen'),
   chatList: $('chat-list'), chatEmpty: $('chat-empty'), msgCount: $('msg-count'),
   chatInputRow: $('chat-input-row'), chatOffline: $('chat-offline'), chatDraft: $('chat-draft'), btnSend: $('btn-send'),
+  btnScreenShare: $('btn-screen-share'), screenShareLabel: $('screen-share-label'),
+  screenGrid: $('screen-grid'), screenEmpty: $('screen-empty'),
   modal: $('modal-incoming'), incIcon: $('inc-icon'), incExt: $('inc-ext'),
   incName: $('inc-name'), incSize: $('inc-size'), btnAccept: $('btn-accept'), btnReject: $('btn-reject'),
   toast: $('toast'),
@@ -386,6 +392,7 @@ function setupPeer(id, label) {
     polite: myId < id, makingOffer: false, ignoreOffer: false, pendingCandidates: [],
     connState: 'connecting', pal: nextPeerPal(), chipEl: null,
     pendingDecision: null, currentRecvId: null, negTimer: null,
+    screenSender: null, screenTileEl: null,   // our screen-share track sent to this peer + their incoming tile
   };
   peers.set(id, p);
 
@@ -410,6 +417,11 @@ function setupPeer(id, label) {
     if (st === 'failed') { toast(p.label + ' 連線失敗'); teardownPeer(p, p.label + ' 連線失敗'); }
   };
   p.pc.ondatachannel = (e) => setupDataChannel(p, e.channel);
+  p.pc.ontrack = (e) => {
+    const stream = e.streams[0] || new MediaStream([e.track]);
+    renderRemoteScreenTile(p, stream);
+    e.track.addEventListener('ended', () => removeRemoteScreenTile(p));
+  };
 
   if (!p.polite) {                           // impolite peer initiates
     setupDataChannel(p, p.pc.createDataChannel('p2p-file', { ordered: true }));
@@ -470,6 +482,7 @@ function onPeerConnected(p) {
   updatePeerChip(p);
   toast('已與 ' + p.label + ' 建立連線');
   refreshRoomUI();
+  if (localScreenStream) attachScreenTrackToPeer(p);
 }
 function teardownPeer(p, reason) {
   if (!peers.has(p.id)) return;
@@ -478,6 +491,9 @@ function teardownPeer(p, reason) {
   if (p.pc) { p.pc.onnegotiationneeded = p.pc.onicecandidate = p.pc.onconnectionstatechange = p.pc.ondatachannel = null; try { p.pc.close(); } catch (e) {} p.pc = null; }
 
   if (p.pendingDecision) { const pd = p.pendingDecision; p.pendingDecision = null; clearTimeout(pd.timer); pd.resolve('error'); }
+
+  p.screenSender = null;
+  removeRemoteScreenTile(p);
 
   failPeerTargets(p.id);
   for (const id in recvMap) {
@@ -848,6 +864,13 @@ function onControl(p, msg) {
     case 'chat':
       receiveChat(p, msg.text);
       break;
+    case 'screen-start':
+      toast(p.label + ' 開始分享畫面');
+      break;
+    case 'screen-stop':
+      toast(p.label + ' 已停止分享畫面');
+      removeRemoteScreenTile(p);
+      break;
   }
 }
 function maybeShowIncoming() {
@@ -947,16 +970,24 @@ function renderTabBadges() {
   const showFiles = fileUnread > 0 && activeTab !== 'files';
   el.badgeFiles.classList.toggle('hidden', !showFiles);
   el.badgeFiles.textContent = fileUnread > 9 ? '9+' : String(fileUnread);
+  const showScreen = screenUnread > 0 && activeTab !== 'screen';
+  el.badgeScreen.classList.toggle('hidden', !showScreen);
+  el.badgeScreen.textContent = screenUnread > 9 ? '9+' : String(screenUnread);
 }
 function setActiveTab(tab) {
   activeTab = tab;
   const filesActive = tab === 'files';
+  const chatActive = tab === 'chat';
+  const screenActive = tab === 'screen';
   styleTab(el.tabFiles, filesActive);
-  styleTab(el.tabChat, !filesActive);
+  styleTab(el.tabChat, chatActive);
+  styleTab(el.tabScreen, screenActive);
   el.panelFiles.classList.toggle('hidden', !filesActive);
-  el.panelChat.classList.toggle('hidden', filesActive);
+  el.panelChat.classList.toggle('hidden', !chatActive);
+  el.panelScreen.classList.toggle('hidden', !screenActive);
   if (filesActive) fileUnread = 0;
-  else { unread = 0; scrollChatToBottom(); }
+  else if (chatActive) { unread = 0; scrollChatToBottom(); }
+  else if (screenActive) { screenUnread = 0; }
   renderTabBadges();
 }
 
@@ -1050,11 +1081,122 @@ function clearChat() {
 }
 
 /* ------------------------------------------------------------------ *
+ *  Screen share — one local getDisplayMedia() stream, its video track
+ *  added as a sender to every connected peer's RTCPeerConnection (this
+ *  reuses the perfect-negotiation renegotiation path in setupPeer's
+ *  onnegotiationneeded — no protocol changes needed there). Incoming
+ *  shares arrive via pc.ontrack and render as tiles keyed by peer.
+ * ------------------------------------------------------------------ */
+function updateScreenChrome() {
+  const sharing = !!localScreenStream;
+  el.screenShareLabel.textContent = sharing ? '停止分享畫面' : '分享我的螢幕畫面';
+  el.btnScreenShare.classList.toggle('btn-outline', sharing);
+  el.btnScreenShare.classList.toggle('btn-primary', !sharing);
+  const hasTiles = el.screenGrid.children.length > 0;
+  el.screenEmpty.classList.toggle('hidden', hasTiles);
+  renderTabBadges();
+}
+function screenTileHtml(label, muted) {
+  return (
+    '<div style="position:relative;border-radius:12px;overflow:hidden;background:#0e1622;aspect-ratio:16/9;">' +
+      '<video autoplay playsinline' + (muted ? ' muted' : '') + ' style="width:100%;height:100%;object-fit:contain;display:block;background:#0e1622;"></video>' +
+      '<span style="position:absolute;left:8px;bottom:8px;padding:3px 9px;border-radius:9999px;background:rgba(14,22,34,0.72);color:#fff;font:600 10.5px/1.4 var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:calc(100% - 16px);"></span>' +
+    '</div>'
+  );
+}
+let localScreenTileEl = null;
+function renderLocalScreenTile() {
+  if (localScreenTileEl) return;
+  const node = document.createElement('div');
+  node.innerHTML = screenTileHtml('我（分享中）', true);
+  const wrap = node.firstElementChild;
+  wrap.querySelector('video').srcObject = localScreenStream;
+  wrap.querySelector('span').textContent = '我（分享中）';
+  localScreenTileEl = wrap;
+  el.screenGrid.appendChild(wrap);
+  updateScreenChrome();
+}
+function removeLocalScreenTile() {
+  if (localScreenTileEl && localScreenTileEl.parentNode) localScreenTileEl.parentNode.removeChild(localScreenTileEl);
+  localScreenTileEl = null;
+  updateScreenChrome();
+}
+function renderRemoteScreenTile(p, stream) {
+  if (!p.screenTileEl) {
+    const node = document.createElement('div');
+    node.innerHTML = screenTileHtml(p.label, true);
+    p.screenTileEl = node.firstElementChild;
+    el.screenGrid.appendChild(p.screenTileEl);
+    if (activeTab !== 'screen') { screenUnread++; }
+  }
+  p.screenTileEl.querySelector('span').textContent = p.label;
+  p.screenTileEl.querySelector('video').srcObject = stream;
+  updateScreenChrome();
+}
+function removeRemoteScreenTile(p) {
+  if (!p.screenTileEl) return;
+  if (p.screenTileEl.parentNode) p.screenTileEl.parentNode.removeChild(p.screenTileEl);
+  p.screenTileEl = null;
+  updateScreenChrome();
+}
+function attachScreenTrackToPeer(p) {
+  if (!localScreenStream || !p.pc || p.screenSender) return;
+  const track = localScreenStream.getVideoTracks()[0];
+  if (!track) return;
+  try {
+    p.screenSender = p.pc.addTrack(track, localScreenStream);
+    dcSendTo(p, JSON.stringify({ t: 'screen-start' }));
+  } catch (e) {
+    console.warn('[p2p] addTrack failed for ' + p.label, e);
+  }
+}
+function detachScreenTrackFromPeer(p) {
+  if (!p.screenSender) return;
+  if (p.pc) { try { p.pc.removeTrack(p.screenSender); } catch (e) {} }
+  p.screenSender = null;
+  dcSendTo(p, JSON.stringify({ t: 'screen-stop' }));
+}
+async function startScreenShare() {
+  if (localScreenStream) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    toast('此瀏覽器不支援畫面分享');
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+  } catch (e) {
+    return; // user cancelled the picker — not an error
+  }
+  localScreenStream = stream;
+  const track = stream.getVideoTracks()[0];
+  if (track) track.addEventListener('ended', stopScreenShare); // native "Stop sharing" UI
+  renderLocalScreenTile();
+  for (const p of peers.values()) {
+    if (p.dc && p.dc.readyState === 'open') attachScreenTrackToPeer(p);
+  }
+  toast('已開始分享螢幕畫面');
+}
+function stopScreenShare() {
+  if (!localScreenStream) return;
+  for (const p of peers.values()) detachScreenTrackFromPeer(p);
+  localScreenStream.getTracks().forEach(t => t.stop());
+  localScreenStream = null;
+  removeLocalScreenTile();
+  toast('已停止分享螢幕畫面');
+}
+function toggleScreenShare() {
+  if (localScreenStream) stopScreenShare();
+  else startScreenShare();
+}
+
+/* ------------------------------------------------------------------ *
  *  Room actions
  * ------------------------------------------------------------------ */
 function joinRoom(code) {
   code = sanitizeCode(code);
   if (!code) return;
+  stopScreenShare();
   teardownAllPeers();
   clearChat();
   roomCode = code;
@@ -1066,6 +1208,7 @@ function joinRoom(code) {
 }
 function disconnect() {
   sig({ kind: 'bye' });
+  stopScreenShare();
   teardownAllPeers();
   clearChat();
   roomCode = genCode();          // fresh room so old peers can't rejoin
@@ -1096,6 +1239,8 @@ el.btnCopy.addEventListener('click', async () => {
 
 el.tabFiles.addEventListener('click', () => setActiveTab('files'));
 el.tabChat.addEventListener('click', () => setActiveTab('chat'));
+el.tabScreen.addEventListener('click', () => setActiveTab('screen'));
+el.btnScreenShare.addEventListener('click', toggleScreenShare);
 el.btnSend.addEventListener('click', sendChat);
 el.chatDraft.addEventListener('input', autoResizeDraft);
 el.chatDraft.addEventListener('keydown', (e) => {

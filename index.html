@@ -143,17 +143,22 @@
     <!-- RIGHT: files + chat -->
     <section class="p2p-files" style="flex:1.3 1 360px;min-width:0;display:flex;flex-direction:column;gap:14px;">
 
-      <!-- tab bar: files / messages -->
-      <div style="display:flex;gap:6px;padding:5px;border-radius:14px;background:var(--bg);border:1px solid var(--border);">
-        <button id="tab-files" style="flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px;border:none;cursor:pointer;border-radius:10px;background:var(--gradient-1);box-shadow:0 6px 14px -8px rgba(14,61,100,0.55);font:700 12.5px/1 var(--font-display);color:#fff;transition:all var(--transition);">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 16V4M12 4L7 9M12 4l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-          <span>檔案傳輸</span>
-          <span id="badge-files" class="hidden" style="min-width:17px;height:17px;padding:0 4px;border-radius:9999px;background:var(--blue);color:#fff;font:700 9.5px/17px var(--font-mono);text-align:center;animation:ring 2s ease-out infinite;">0</span>
+      <!-- tab bar: files / messages / screen share -->
+      <div style="display:flex;gap:5px;padding:5px;border-radius:14px;background:var(--bg);border:1px solid var(--border);">
+        <button id="tab-files" style="flex:1;min-width:0;display:flex;align-items:center;justify-content:center;gap:6px;padding:11px 5px;border:none;cursor:pointer;border-radius:10px;background:var(--gradient-1);box-shadow:0 6px 14px -8px rgba(14,61,100,0.55);font:700 12px/1 var(--font-display);color:#fff;transition:all var(--transition);overflow:hidden;">
+          <svg width="15" height="15" style="flex:none;" viewBox="0 0 24 24" fill="none"><path d="M12 16V4M12 4L7 9M12 4l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">檔案傳輸</span>
+          <span id="badge-files" class="hidden" style="flex:none;min-width:17px;height:17px;padding:0 4px;border-radius:9999px;background:var(--blue);color:#fff;font:700 9.5px/17px var(--font-mono);text-align:center;animation:ring 2s ease-out infinite;">0</span>
         </button>
-        <button id="tab-chat" style="position:relative;flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px;border:none;cursor:pointer;border-radius:10px;background:transparent;box-shadow:none;font:700 12.5px/1 var(--font-display);color:var(--muted);transition:all var(--transition);">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M20 12a7 7 0 0 1-9.5 6.5L5 20l1.5-4.5A7 7 0 1 1 20 12z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>
-          <span>訊息 · 剪貼簿</span>
-          <span id="badge-chat" class="hidden" style="min-width:17px;height:17px;padding:0 4px;border-radius:9999px;background:var(--purple);color:#fff;font:700 9.5px/17px var(--font-mono);text-align:center;animation:ring 2s ease-out infinite;">0</span>
+        <button id="tab-chat" style="position:relative;flex:1;min-width:0;display:flex;align-items:center;justify-content:center;gap:6px;padding:11px 5px;border:none;cursor:pointer;border-radius:10px;background:transparent;box-shadow:none;font:700 12px/1 var(--font-display);color:var(--muted);transition:all var(--transition);overflow:hidden;">
+          <svg width="15" height="15" style="flex:none;" viewBox="0 0 24 24" fill="none"><path d="M20 12a7 7 0 0 1-9.5 6.5L5 20l1.5-4.5A7 7 0 1 1 20 12z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>
+          <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">訊息 · 剪貼簿</span>
+          <span id="badge-chat" class="hidden" style="flex:none;min-width:17px;height:17px;padding:0 4px;border-radius:9999px;background:var(--purple);color:#fff;font:700 9.5px/17px var(--font-mono);text-align:center;animation:ring 2s ease-out infinite;">0</span>
+        </button>
+        <button id="tab-screen" style="position:relative;flex:1;min-width:0;display:flex;align-items:center;justify-content:center;gap:6px;padding:11px 5px;border:none;cursor:pointer;border-radius:10px;background:transparent;box-shadow:none;font:700 12px/1 var(--font-display);color:var(--muted);transition:all var(--transition);overflow:hidden;">
+          <svg width="15" height="15" style="flex:none;" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="13" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M8 21h8M12 17v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">畫面分享</span>
+          <span id="badge-screen" class="hidden" style="flex:none;min-width:17px;height:17px;padding:0 4px;border-radius:9999px;background:#257e45;color:#fff;font:700 9.5px/17px var(--font-mono);text-align:center;animation:ring 2s ease-out infinite;">0</span>
         </button>
       </div>
 
@@ -203,6 +208,24 @@
         <div id="chat-offline" style="display:flex;align-items:center;gap:9px;padding:13px 15px;border-radius:12px;border:1px dashed var(--border-strong);background:var(--bg);">
           <span style="width:8px;height:8px;border-radius:50%;background:#a45a32;animation:ring 2s ease-out infinite;"></span>
           <span style="font:500 12px/1.4 var(--font-mono);color:var(--muted);">加入房間後即可即時傳訊息與共用剪貼簿內容。</span>
+        </div>
+      </div>
+
+      <!-- panel: screen share -->
+      <div id="panel-screen" class="hidden" style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);box-shadow:var(--shadow-card);padding:20px;display:flex;flex-direction:column;gap:14px;min-width:0;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+          <div class="eyebrow eyebrow-blue"><span class="eyebrow-dot"></span>畫面分享</div>
+          <button id="btn-screen-share" class="btn btn-primary" style="padding:10px 16px;cursor:pointer;border:none;width:auto;margin:0;display:flex;align-items:center;gap:8px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="13" rx="2" stroke="currentColor" stroke-width="1.9"/><path d="M8 21h8M12 17v4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+            <span id="screen-share-label">分享我的螢幕畫面</span>
+          </button>
+        </div>
+        <p style="margin:-4px 0 0;font-size:12px;line-height:1.6;color:var(--muted);">直接透過 WebRTC 傳送畫面，不經任何伺服器；房間內每台已連線裝置都能同時看到你分享的畫面。</p>
+
+        <div id="screen-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;"></div>
+
+        <div id="screen-empty" style="padding:34px 20px;text-align:center;border:1px dashed var(--border-strong);border-radius:var(--radius-md);background:var(--bg);">
+          <div style="font:500 12.5px/1.6 var(--font-mono);color:var(--muted);">目前沒有人分享畫面</div>
         </div>
       </div>
 
